@@ -69,6 +69,7 @@ task :start => 'libvirtinator:load_settings' do
       Rake::Task["image:umount"].invoke
     end
     Rake::Task['create_data'].invoke
+    Rake::Task['pg_create_data'].invoke
     Rake::Task['define_domain'].invoke
     Rake::Task['start_domain'].invoke
     Rake::Task['reset_known_hosts_on_host'].invoke
@@ -219,6 +220,9 @@ task :update_root_image => 'libvirtinator:load_settings' do
       @data_disk_enabled      = fetch(:data_disk_enabled)
       @data_disk_partition    = fetch(:data_disk_partition)
       @data_disk_mount_point  = fetch(:data_disk_mount_point)
+      @pg_data_disk_enabled      = fetch(:pg_data_disk_enabled)
+      @pg_data_disk_partition    = fetch(:pg_data_disk_partition)
+      @pg_data_disk_mount_point  = fetch(:pg_data_disk_mount_point)
       @network                = fetch("#{fetch(:cidr)}_network")
       @gateway                = fetch("#{fetch(:cidr)}_gateway")
       @ip                     = fetch(:ip)
@@ -271,6 +275,7 @@ task :update_root_image => 'libvirtinator:load_settings' do
           "\"chown", "#{user}:#{user}", "/home/#{user}/.ssh/authorized_keys\""
         execute "chmod", "600", "#{mount_point}/home/#{user}/.ssh/authorized_keys"
         execute "mkdir", "-p", "#{mount_point}#{fetch(:data_disk_mount_point)}" if fetch(:data_disk_enabled)
+        execute "mkdir", "-p", "#{mount_point}#{fetch(:pg_data_disk_mount_point)}" if fetch(:pg_data_disk_enabled)
       ensure
         mounts.each do |mount|
           execute "umount", "#{mount_point}/#{mount}"
@@ -319,6 +324,44 @@ _EOF_"
   end
 end
 
+task :pg_create_data => 'libvirtinator:load_settings' do
+  on roles(:app) do
+    as 'root' do
+      unless fetch(:pg_data_disk_enabled)
+        info "Not using a separate data disk."
+        break
+      end
+      if fetch(:pg_data_disk_type) == "qemu"
+        if ! test("[", "-f", fetch(:pg_data_disk_qemu_path), "]") or ENV['pg_recreate_data'] == "true"
+          execute "guestfish", "--new", "disk:#{fetch(:pg_data_disk_gb)}G << _EOF_
+mkfs ext4 /dev/vda
+_EOF_"
+          execute "qemu-img", "convert", "-O", "qcow2", "test1.img", "test1.qcow2"
+          execute "rm", "test1.img"
+          execute "mv", "test1.qcow2", fetch(:pg_data_disk_qemu_path)
+        end
+      elsif fetch(:pg_data_disk_type) == "lv"
+        if ENV['pg_recreate_data'] == "true"
+          if test "[", "-b", fetch(:pg_data_disk_lv_path), "]"
+            Rake::Task['pg_lv:pg_recreate'].invoke
+          else
+            Rake::Task['pg_lv:pg_create'].invoke
+          end 
+        else
+          if test "[", "-b", fetch(:pg_data_disk_lv_path), "]"
+            info "Found and using existing logical volume #{fetch(:pg_data_disk_lv_path)}"
+          else
+            Rake::Task['pg_lv:pg_create'].invoke
+          end
+        end
+      else
+        fatal "No recognized disk type (lv, qemu), yet size is greater than zero!"
+        fatal "Fixed this by adding a recognized disk type (lv, qemu) to your config."
+        exit
+      end
+    end
+  end
+end
 task :define_domain => 'libvirtinator:load_settings' do
   on roles(:app) do
     as 'root' do
@@ -331,6 +374,9 @@ task :define_domain => 'libvirtinator:load_settings' do
       @data_disk_type         = fetch(:data_disk_type)
       @data_disk_lv_path      = fetch(:data_disk_lv_path)
       @data_disk_qemu_path    = fetch(:data_disk_qemu_path)
+      @pg_data_disk_enabled   = fetch(:pg_data_disk_enabled)
+      @pg_data_disk_type      = fetch(:pg_data_disk_type)
+      @pg_data_disk_lv_path   = fetch(:pg_data_disk_lv_path)
       @bridge                 = fetch(:bridge)
       template = File.new(File.expand_path("templates/libvirtinator/server.xml.erb")).read
       generated_config_file = ERB.new(template).result(binding)
